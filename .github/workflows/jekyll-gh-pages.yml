@@ -1,0 +1,394 @@
+"""
+Advanced Time Series Forecasting with Attention-Based LSTMs and Explainability
+Save as: ts_forecast_attention.py
+Run: python ts_forecast_attention.py
+"""
+
+import os
+import math
+import random
+import numpy as np
+import pandas as pd
+from tqdm import tqdm
+import matplotlib.pyplot as plt
+import seaborn as sns
+from sklearn.preprocessing import StandardScaler
+from sklearn.metrics import mean_absolute_error, mean_squared_error
+
+import torch
+import torch.nn as nn
+from torch.utils.data import Dataset, DataLoader
+
+# -----------------------------
+# 1) Data generation utilities
+# -----------------------------
+def generate_multivariate_ts(n_steps=2000, n_vars=3, seed=42):
+    """
+    Create a multivariate time series with:
+    - global trend
+    - per-variable seasonality (different periods)
+    - noise
+    - controlled autocorrelation
+    Returns pandas.DataFrame with columns var0, var1, ...
+    """
+    np.random.seed(seed)
+    t = np.arange(n_steps)
+    df = pd.DataFrame({'t': t})
+    # Global trend
+    trend = 0.001 * (t ** 1.2)  # slight nonlinear growth
+    for i in range(n_vars):
+        freq = 24 + 6 * i  # different seasonal period
+        phase = np.random.uniform(0, 2 * np.pi)
+        seasonal = (np.sin(2 * np.pi * t / freq + phase) +
+                    0.5 * np.sin(2 * np.pi * t / (freq/2 + 1.0) + phase/2))
+        # autoregressive-like component
+        ar = np.zeros(n_steps)
+        noise = np.random.normal(scale=0.5 + 0.2 * i, size=n_steps)
+        for k in range(1, n_steps):
+            ar[k] = 0.6 * ar[k-1] + 0.2 * noise[k-1]  # simple AR(1)
+        # scale and combine
+        values = 2.0 * seasonal + trend * (0.5 + 0.3 * i) + ar + noise
+        df[f'var{i}'] = values
+    df = df.drop(columns=['t'])
+    return df
+
+# -----------------------------
+# 2) Dataset / Dataloader
+# -----------------------------
+class SequenceDataset(Dataset):
+    def __init__(self, data: np.ndarray, seq_len: int, target_idx: int = 0):
+        """
+        data: numpy array shape (T, features)
+        seq_len: length of input sequence
+        target_idx: feature index to predict (default 0)
+        """
+        self.data = data
+        self.seq_len = seq_len
+        self.target_idx = target_idx
+        self.n_samples = data.shape[0] - seq_len
+
+    def __len__(self):
+        return max(0, self.n_samples)
+
+    def __getitem__(self, idx):
+        x = self.data[idx: idx + self.seq_len]        # shape (seq_len, features)
+        y = self.data[idx + self.seq_len, self.target_idx]  # scalar target
+        return torch.tensor(x, dtype=torch.float32), torch.tensor(y, dtype=torch.float32)
+
+# -----------------------------
+# 3) Attention LSTM (PyTorch)
+# -----------------------------
+class AttentionLayer(nn.Module):
+    """
+    Simple attention over LSTM outputs (sequence of hidden states).
+    We'll use a learnable scoring: score = v^T tanh(W_h h_t + W_s s_last)
+    where s_last is final hidden (or last output).
+    """
+    def __init__(self, hidden_dim):
+        super().__init__()
+        self.W_h = nn.Linear(hidden_dim, hidden_dim, bias=False)
+        self.W_s = nn.Linear(hidden_dim, hidden_dim, bias=False)
+        self.v = nn.Linear(hidden_dim, 1, bias=False)
+
+    def forward(self, H, s_last):
+        # H: (batch, seq_len, hidden_dim)
+        # s_last: (batch, hidden_dim)
+        Wh = self.W_h(H)  # (batch, seq_len, hidden_dim)
+        Ws = self.W_s(s_last).unsqueeze(1)  # (batch, 1, hidden_dim)
+        score = self.v(torch.tanh(Wh + Ws)).squeeze(-1)  # (batch, seq_len)
+        attn_weights = torch.softmax(score, dim=1)       # (batch, seq_len)
+        context = (H * attn_weights.unsqueeze(-1)).sum(dim=1)  # (batch, hidden_dim)
+        return context, attn_weights
+
+class LSTMAttentionModel(nn.Module):
+    def __init__(self, input_dim, hidden_dim=64, num_layers=1, dropout=0.1):
+        super().__init__()
+        self.hidden_dim = hidden_dim
+        self.num_layers = num_layers
+        self.lstm = nn.LSTM(input_dim, hidden_dim, num_layers=num_layers,
+                            batch_first=True, dropout=dropout if num_layers>1 else 0.0)
+        self.attn = AttentionLayer(hidden_dim)
+        self.fc = nn.Linear(hidden_dim, 1)  # predict scalar
+        self.dropout = nn.Dropout(dropout)
+
+    def forward(self, x):
+        # x: (batch, seq_len, input_dim)
+        outputs, (hn, cn) = self.lstm(x)  # outputs: (batch, seq_len, hidden_dim)
+        # use last hidden layer (from last LSTM layer)
+        s_last = hn[-1]  # (batch, hidden_dim)
+        context, attn_weights = self.attn(outputs, s_last)  # (batch, hidden_dim), (batch, seq_len)
+        context = self.dropout(context)
+        out = self.fc(context).squeeze(-1)  # (batch,)
+        return out, attn_weights
+
+# -----------------------------
+# 4) Training / Evaluation helpers
+# -----------------------------
+def train_model(model, train_loader, val_loader, epochs=50, lr=1e-3, device='cpu'):
+    opt = torch.optim.Adam(model.parameters(), lr=lr)
+    criterion = nn.MSELoss()
+    model.to(device)
+    best_val_loss = float('inf')
+    best_state = None
+    history = {'train_loss': [], 'val_loss': []}
+
+    for ep in range(1, epochs+1):
+        model.train()
+        train_losses = []
+        for X, y in train_loader:
+            X = X.to(device)
+            y = y.to(device)
+            opt.zero_grad()
+            pred, _ = model(X)
+            loss = criterion(pred, y)
+            loss.backward()
+            opt.step()
+            train_losses.append(loss.item())
+        avg_train = np.mean(train_losses)
+
+        # validation
+        model.eval()
+        val_losses = []
+        with torch.no_grad():
+            for Xv, yv in val_loader:
+                Xv = Xv.to(device); yv = yv.to(device)
+                predv, _ = model(Xv)
+                val_losses.append(criterion(predv, yv).item())
+        avg_val = np.mean(val_losses)
+
+        history['train_loss'].append(avg_train)
+        history['val_loss'].append(avg_val)
+        print(f"Epoch {ep}/{epochs}  Train MSE: {avg_train:.6f}  Val MSE: {avg_val:.6f}")
+
+        # simple checkpoint
+        if avg_val < best_val_loss:
+            best_val_loss = avg_val
+            best_state = model.state_dict().copy()
+
+    # load best
+    if best_state is not None:
+        model.load_state_dict(best_state)
+    return model, history
+
+def evaluate_and_plot(model, dataset_full, scaler_target, seq_len, device='cpu', save_dir='results'):
+    """
+    dataset_full: full numpy data for generating rolling predictions.
+    scaler_target: scaler used for target (so we can inverse transform)
+    We'll do rolling predictions on test slice and plot attention.
+    """
+    os.makedirs(save_dir, exist_ok=True)
+    model.to(device)
+    model.eval()
+
+    data = dataset_full  # shape (T, features)
+    T = data.shape[0]
+    # We'll predict for indices from start_pred to end_pred
+    start_pred = int(T * 0.7)
+    X_windows = []
+    true_vals = []
+    attn_list = []
+    preds = []
+
+    with torch.no_grad():
+        for i in range(start_pred, T - seq_len):
+            x = data[i: i + seq_len]  # (seq_len, features)
+            y_true = data[i + seq_len, 0]  # target var0
+            X_tensor = torch.tensor(x, dtype=torch.float32).unsqueeze(0).to(device)
+            out, attn_weights = model(X_tensor)  # out: (batch=1)
+            pred = out.cpu().numpy().item()
+            preds.append(pred)
+            true_vals.append(y_true)
+            attn_list.append(attn_weights.cpu().numpy().flatten())
+            X_windows.append(x)
+
+    # inverse transform scalars
+    preds_inv = scaler_target.inverse_transform(np.array(preds).reshape(-1, 1)).flatten()
+    true_inv = scaler_target.inverse_transform(np.array(true_vals).reshape(-1, 1)).flatten()
+
+    # metrics
+    mae = mean_absolute_error(true_inv, preds_inv)
+    rmse = math.sqrt(mean_squared_error(true_inv, preds_inv))
+    print(f"\nEvaluation on rolling window: MAE={mae:.4f}, RMSE={rmse:.4f}")
+
+    # Time axis
+    times = np.arange(start_pred + seq_len, start_pred + seq_len + len(preds_inv))
+
+    # plot predictions
+    plt.figure(figsize=(12,5))
+    plt.plot(times, true_inv, label='True (target)', linewidth=1.2)
+    plt.plot(times, preds_inv, label='Predicted', linewidth=1.2)
+    plt.title('True vs Predicted (rolling forecast)')
+    plt.legend()
+    plt.tight_layout()
+    plt.savefig(os.path.join(save_dir, 'predictions.png'))
+    plt.show()
+
+    # plot attention heatmap for a few examples
+    num_examples = min(6, len(attn_list))
+    idxs = np.linspace(0, len(attn_list)-1, num_examples, dtype=int)
+    fig, axes = plt.subplots(num_examples, 1, figsize=(10, 2.2*num_examples), sharex=True)
+    for idxi, ax in zip(idxs, axes):
+        att = attn_list[idxi]  # shape (seq_len,)
+        ax.bar(np.arange(len(att)), att)
+        ax.set_ylabel('Attention')
+        ax.set_title(f"Attention weights example #{idxi}")
+    plt.xlabel("Time-step (within input sequence)")
+    plt.tight_layout()
+    plt.savefig(os.path.join(save_dir, 'attention_examples.png'))
+    plt.show()
+
+    # also show a heatmap over selected window ranges
+    sel = np.vstack(attn_list[:min(100, len(attn_list))])  # (n, seq_len)
+    plt.figure(figsize=(12,4))
+    sns.heatmap(sel, cmap='viridis')
+    plt.title('Attention weights heatmap (first windows)')
+    plt.xlabel('Input sequence timestep')
+    plt.ylabel('Window index')
+    plt.tight_layout()
+    plt.savefig(os.path.join(save_dir, 'attention_heatmap.png'))
+    plt.show()
+
+    return {'mae': mae, 'rmse': rmse, 'preds_inv': preds_inv, 'true_inv': true_inv, 'attn_list': attn_list}
+
+# -----------------------------
+# 5) Main - prepare data, train, evaluate
+# -----------------------------
+def main():
+    # settings
+    SEED = 42
+    np.random.seed(SEED)
+    torch.manual_seed(SEED)
+    random.seed(SEED)
+
+    # generate dataset
+    n_steps = 2500
+    n_vars = 4
+    df = generate_multivariate_ts(n_steps=n_steps, n_vars=n_vars, seed=SEED)
+    print("Data shape:", df.shape)
+    # show a preview
+    df.head()
+
+    # hyperparams
+    seq_len = 48      # lookback
+    target_idx = 0    # predict var0
+    batch_size = 64
+    hidden_dim = 128
+    epochs = 30
+    lr = 1e-3
+    device = 'cuda' if torch.cuda.is_available() else 'cpu'
+    print("Using device:", device)
+
+    # train/val/test split (temporal)
+    train_frac = 0.6
+    val_frac = 0.2
+    T = df.shape[0]
+    train_end = int(T * train_frac)
+    val_end = int(T * (train_frac + val_frac))
+
+    # scale features (fit on train)
+    scaler = StandardScaler()
+    scaler_target = StandardScaler()
+    train_data = df.iloc[:train_end].values
+    scaler.fit(train_data)
+    # We'll scale target with a separate scaler for easy inverse transform
+    scaler_target.fit(train_data[:, target_idx].reshape(-1,1))
+
+    data_scaled = scaler.transform(df.values)
+    # Keep full scaled data for evaluation later
+    full_scaled = data_scaled.copy()
+
+    # create datasets
+    train_data_scaled = data_scaled[:train_end]
+    val_data_scaled = data_scaled[train_end:val_end + seq_len]  # make sure windows exist
+    test_data_scaled = data_scaled[val_end:]  # used only for final rolling predictions
+
+    train_ds = SequenceDataset(data=train_data_scaled, seq_len=seq_len, target_idx=target_idx)
+    val_ds = SequenceDataset(data=data_scaled[train_end - seq_len:val_end + seq_len], seq_len=seq_len, target_idx=target_idx)
+    # val dataset created from a slice that ensures windows cover validation area
+
+    train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True)
+    val_loader = DataLoader(val_ds, batch_size=batch_size, shuffle=False)
+
+    # model
+    model = LSTMAttentionModel(input_dim=n_vars, hidden_dim=hidden_dim, num_layers=2, dropout=0.2)
+    print(model)
+
+    model, history = train_model(model, train_loader, val_loader, epochs=epochs, lr=lr, device=device)
+
+    # save model and scalers
+    os.makedirs('saved', exist_ok=True)
+    torch.save(model.state_dict(), 'saved/lstm_attention_model.pth')
+    import joblib
+    joblib.dump(scaler, 'saved/scaler_all_features.pkl')
+    joblib.dump(scaler_target, 'saved/scaler_target.pkl')
+    print("Saved model and scalers in ./saved/")
+
+    # plot training history
+    plt.figure(figsize=(8,4))
+    plt.plot(history['train_loss'], label='train MSE')
+    plt.plot(history['val_loss'], label='val MSE')
+    plt.yscale('log')
+    plt.legend()
+    plt.title('Training history (MSE, log-scale)')
+    plt.tight_layout()
+    plt.savefig('saved/training_history.png')
+    plt.show()
+
+    # evaluate on rolling windows (use full scaled data and scaler_target for inverse)
+    eval_stats = evaluate_and_plot(model, full_scaled, scaler_target, seq_len, device=device, save_dir='saved')
+
+    print("Done.")
+
+if __name__ == '__main__':
+    main()
+# Sample workflow for building and deploying a Jekyll site to GitHub Pages
+name: Deploy Jekyll with GitHub Pages dependencies preinstalled
+
+on:
+  # Runs on pushes targeting the default branch
+  push:
+    branches: ["main"]
+
+  # Allows you to run this workflow manually from the Actions tab
+  workflow_dispatch:
+
+# Sets permissions of the GITHUB_TOKEN to allow deployment to GitHub Pages
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+# Allow only one concurrent deployment, skipping runs queued between the run in-progress and latest queued.
+# However, do NOT cancel in-progress runs as we want to allow these production deployments to complete.
+concurrency:
+  group: "pages"
+  cancel-in-progress: false
+
+jobs:
+  # Build job
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Setup Pages
+        uses: actions/configure-pages@v5
+      - name: Build with Jekyll
+        uses: actions/jekyll-build-pages@v1
+        with:
+          source: ./
+          destination: ./_site
+      - name: Upload artifact
+        uses: actions/upload-pages-artifact@v3
+
+  # Deployment job
+  deploy:
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    runs-on: ubuntu-latest
+    needs: build
+    steps:
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4
